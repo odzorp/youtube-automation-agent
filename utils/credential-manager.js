@@ -4,6 +4,7 @@ const { google } = require('googleapis');
 const inquirer = require('inquirer');
 const chalk = require('chalk');
 const { Logger } = require('./logger');
+const { encrypt, decrypt, isEncrypted } = require('./token-crypto');
 
 class CredentialManager {
   constructor() {
@@ -36,8 +37,18 @@ class CredentialManager {
 
   async loadTokens() {
     try {
-      const data = await fs.readFile(this.tokensPath, 'utf8');
-      this.tokens = JSON.parse(data);
+      const raw = await fs.readFile(this.tokensPath, 'utf8');
+      if (isEncrypted(raw)) {
+        this.tokens = decrypt(raw);
+        if (!this.tokens) {
+          this.logger.warn('Token file is encrypted but no encryption key is set — cannot decrypt');
+          this.tokens = {};
+        }
+      } else {
+        this.tokens = JSON.parse(raw);
+        // Migrate plaintext tokens to encrypted on first load
+        await this.saveTokens();
+      }
     } catch (error) {
       this.tokens = {};
     }
@@ -50,7 +61,13 @@ class CredentialManager {
 
   async saveTokens() {
     await fs.mkdir(path.dirname(this.tokensPath), { recursive: true });
-    await fs.writeFile(this.tokensPath, JSON.stringify(this.tokens, null, 2));
+    const encrypted = encrypt(this.tokens);
+    if (encrypted) {
+      await fs.writeFile(this.tokensPath, encrypted);
+    } else {
+      this.logger.warn('No TOKEN_ENCRYPTION_KEY or JWT_SECRET set — saving tokens in plaintext');
+      await fs.writeFile(this.tokensPath, JSON.stringify(this.tokens, null, 2));
+    }
   }
 
   // YouTube API Authentication
@@ -146,12 +163,27 @@ class CredentialManager {
     );
 
     oauth2Client.setCredentials(this.tokens.youtube);
+
+    // Persist refreshed tokens automatically
+    oauth2Client.on('tokens', (newTokens) => {
+      this.tokens.youtube = { ...this.tokens.youtube, ...newTokens };
+      this.saveTokens().catch(err =>
+        this.logger.error('Failed to persist refreshed tokens:', err)
+      );
+      this.logger.info('YouTube tokens refreshed and saved');
+    });
+
     return oauth2Client;
   }
 
   getYouTubeClient() {
     const auth = this.getYouTubeAuth();
     return google.youtube({ version: 'v3', auth });
+  }
+
+  // Get raw credentials object for AI services
+  getCredentials() {
+    return this.credentials;
   }
 
   // OpenAI API Setup
